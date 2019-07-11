@@ -5,7 +5,6 @@ import os
 from .py_utils import locate, get_single_key_value_pair, create_instance
 from .log_anywhere import register_logger, log_scalar
 from .tensorboard import TensorboardMixin
-from inferno.io.transform import Compose
 
 try:
     import inferno
@@ -105,6 +104,15 @@ class ParsingMixin(object):
         loader_kwargs['dataset'] = dataset
 
         return DataLoader(**loader_kwargs)
+
+    # overwrite this function to define infer loader
+    def build_infer_loader(self):
+        loader_kwargs = self.get('infer_loader')
+        dataset = create_instance(loader_kwargs['dataset'], self.DATASET_LOCATIONS)
+        loader_kwargs['dataset'] = dataset
+
+        return DataLoader(**loader_kwargs)
+
 
     def build_criterion(self):
         return create_instance(self.get('criterion'), self.CRITERION_LOCATIONS)
@@ -333,3 +341,185 @@ class InfernoMixin(ParsingMixin):
 
     def train(self):
         return self.trainer.fit()
+
+import numpy as np
+
+class AffinityInferenceMixin(ParsingMixin):
+
+
+    def infer(self):
+        full_volume_shape = self.get("full_volume_infer_shape")
+        assert isinstance(full_volume_shape, tuple)
+
+        # TODO: (add augmentation)
+
+        self.trainer.eval_mode()
+
+        # Everytime we should loop over the full dataset (restart generators):
+        loader_iter = self.infer_loader.__iter__()
+
+        from inferno.utils import python_utils as pyu
+        from inferno.io.core.base import IndexSpec
+
+        # Output files
+        full_output = None
+        mask = np.zeros(full_volume_shape)
+
+        # Record the epoch we're validating in
+        iteration_num = 0
+        nb_tot_predictions = len(loader_iter)
+        while True:
+            try:
+                inputs, indices = next(loader_iter)
+            except StopIteration:
+                self.trainer.console.info("Generator exhausted, breaking.")
+                break
+
+            assert all([isinstance(indx, IndexSpec) for indx in indices]), "During inference, the dataloader" \
+                                                                           "should return the indices"
+            self.trainer.console.progress("{} of {} inference predictions done".format(iteration_num, nb_tot_predictions))
+
+            # Delay SIGINTs till after computation
+            with pyu.delayed_keyboard_interrupt(), torch.no_grad():
+                # Wrap
+                inputs = self.trainer.to_device(inputs)
+
+                patch_outputs = self.trainer.apply_model(*inputs)
+
+            patch_outputs = self.postprocess_patch_outputs(patch_outputs)
+
+            for b in range(patch_outputs.shape[0]):
+                batch_numpy_output = patch_outputs[b].data.cpu().numpy()
+                full_output, mask = self.blend_new_patch(full_output, mask,
+                                                        batch_numpy_output,
+                                                        indices[b].base_sequence_at_index)
+
+            iteration_num += 1
+
+
+        # Crop full output:
+        if self.get("inference/global_padding", False):
+            # FIXME: assert and place all this stuff in a better place...!!
+            ds_ratio = self.get("inference/global_ds_ratio")
+            global_padding = self.get("inference/global_padding")
+            full_shape = self.get("full_volume_infer_shape")
+            crop = tuple(slice(pad[0],
+                               full_shape[i] - pad[1],
+                               ds_ratio[i]) for i, pad in enumerate(
+                global_padding))
+            full_output = full_output[(slice(None),) + crop]
+            mask = mask[crop]
+
+        # divide by the mask to normalize all pixels
+        assert (mask != 0).all(), "Not all parts of the dataset have been predicted! " \
+                                  "(Is the stride set correctly..?)"
+        assert mask.shape == full_output.shape[1:]
+        full_output /= mask
+
+        self.save_infer_output(full_output)
+
+    def save_infer_output(self, output):
+        pass
+
+    def postprocess_patch_outputs(self, patch_outputs):
+        return patch_outputs
+
+    def blend_new_patch(self, full_output, mask, patch_output, slicing):
+        assert isinstance(patch_output, np.ndarray)
+        assert patch_output.ndim == 4
+
+        nb_channels = patch_output.shape[0]
+        patch_shape = patch_output.shape[1:]
+        if full_output is None:
+            full_output = np.zeros((nb_channels,) + self.get("full_volume_infer_shape"), dtype='float32')
+
+        local_slicing, global_slicing = self.get_slicings(slicing, patch_shape)
+
+        # TODO: add blending
+        # if self.blending is not None:
+        #     output_patch, blending_mask = self.blending(output_patch)
+        #     mask[global_slicing] += blending_mask[local_slicing]
+        # else:
+        mask[global_slicing[1:]] += 1
+        # add up predictions in the output
+        full_output[global_slicing] += patch_output[local_slicing]
+
+        return full_output, mask
+
+    def get_slicings(self, slicing, shape):
+        slice_crop = self.get("inference/crop_global_slice", False)
+        prediction_crop = self.get("inference/crop_prediction", False)
+        assert all([slicing[i].step == 1 for i in range(3)]), "Downscaling option not implemented yet!"
+
+        # crop away the padding (we treat global as local padding) if specified
+        # this is generally not necessary if we use blending
+        if slice_crop:
+            # slicing w.r.t the global output
+            assert isinstance(slice_crop, (tuple, list))
+            assert len(slice_crop) == 3 and all([len(cr) == 2 for cr in slice_crop])
+            global_slicing = tuple(slice(slicing[i].start + pad[0],
+                                         slicing[i].stop - pad[1])
+                                   for i, pad in enumerate(slice_crop))
+        else:
+            # otherwise do not crop
+            global_slicing = slicing
+        if prediction_crop:
+            # slicing w.r.t the current output
+            assert isinstance(prediction_crop, (tuple, list))
+            assert len(prediction_crop) == 3 and all([len(cr) == 2 for cr in prediction_crop])
+            local_slicing = tuple(slice(pad[0],
+                                        shape[i] - pad[1])
+                                  for i, pad in enumerate(prediction_crop))
+        else:
+            local_slicing = tuple(slice(None, None) for _ in range(3))
+
+        # Add channel dimension:
+        local_slicing = (slice(None), ) + local_slicing
+        global_slicing = (slice(None), ) + global_slicing
+
+        return local_slicing, global_slicing
+
+    @property
+    def trainer(self):
+        """
+        inferno trainer. Will be loaded from file on first use.
+        """
+        if inferno is None:
+            raise ModuleNotFoundError("InfernoMixin requires inferno. You can "
+                                      "install it with `pip install in "
+                                      "pip install inferno-pytorch`")
+        # Build trainer if it doesn't exist
+        if not hasattr(self, '_trainer'):
+
+            # noinspection PyAttributeOutsideInit
+            self._trainer = inferno.trainers.basic.Trainer() \
+                .load(self.get("inference/path_checkpoint_trainer"), best=True)
+
+            self._trainer.to(self.device)
+
+        return self._trainer
+
+    def build_loader(self):
+        trainer = self.trainer
+        trainer.bind_loader('test',
+                                  self.infer_loader)
+
+        if self.val_loader is not None:
+            self._trainer.bind_loader('validate',
+                                      self.val_loader,
+                                      num_targets=self.num_targets)
+
+
+    @property
+    def device(self):
+        # TODO: move to ParsingMixin?
+        if self._device is None:
+            # noinspection PyAttributeOutsideInit
+            self._device = torch.device(self.get('device'))
+        return self._device
+
+    @property
+    def infer_loader(self):
+        if not hasattr(self, '_infer_loader'):
+            self._infer_loader = self.build_infer_loader()
+        return self._infer_loader
