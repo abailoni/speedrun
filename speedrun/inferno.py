@@ -344,8 +344,53 @@ class InfernoMixin(ParsingMixin):
 
 import numpy as np
 
-class AffinityInferenceMixin(ParsingMixin):
 
+class SimpleInferenceMixin(InfernoMixin):
+    def infer_simple(self):
+
+
+        self.trainer.eval_mode()
+        loader_name= "validate"
+
+        # Everytime we should loop over the full dataset (restart generators):
+        # TODO: this will probably load a random batch. You maybe want to turn random=False
+        loader_iter = self.val_loader.__iter__()
+
+        from inferno.utils import python_utils as pyu
+
+        # Record the epoch we're validating in
+        iteration_num = 0
+        nb_tot_predictions = len(loader_iter)
+        while True:
+            try:
+                batch = next(loader_iter)
+            except StopIteration:
+                self.trainer.console.info("Generator exhausted, breaking.")
+                break
+
+            # Delay SIGINTs till after computation
+            with pyu.delayed_keyboard_interrupt(), torch.no_grad():
+                batch = self.trainer.wrap_batch(batch, from_loader=loader_name, volatile=True)
+                # Separate
+                inputs, target = self.trainer.split_batch(batch, from_loader=loader_name)
+
+                # # Wrap
+                # inputs = self.trainer.to_device(inputs)
+                outputs = self.trainer.apply_model(*inputs)
+
+                self.trainer.console.progress(
+                    "{} of {} inference predictions done".format(iteration_num, nb_tot_predictions))
+
+            # TODO: save the outputs somewhere on disk
+            pass
+
+            # TODO: decide if you want to predict more or break
+            break
+
+
+
+
+class AffinityInferenceMixin(ParsingMixin):
 
     def infer(self):
         full_volume_shape = self.get("full_volume_infer_shape")
@@ -363,7 +408,7 @@ class AffinityInferenceMixin(ParsingMixin):
 
         # Output files
         full_output = None
-        mask = np.zeros(full_volume_shape)
+        mask = None
 
         # Record the epoch we're validating in
         iteration_num = 0
@@ -383,16 +428,32 @@ class AffinityInferenceMixin(ParsingMixin):
             with pyu.delayed_keyboard_interrupt(), torch.no_grad():
                 # Wrap
                 inputs = self.trainer.to_device(inputs)
-
                 patch_outputs = self.trainer.apply_model(*inputs)
 
-            patch_outputs = self.postprocess_patch_outputs(patch_outputs)
+            # FIXME: improve this
+            if self.get("inference/return_patch_mask"):
+                assert isinstance(patch_outputs, tuple)
+                assert len(patch_outputs) == 2
+                pred, patch_mask = patch_outputs
+            else:
+                patch_mask = None
+                if isinstance(patch_outputs, list):
+                    pred = patch_outputs[0]
+                else:
+                    pred = patch_outputs
+            pred = self.postprocess_patch_outputs(pred)
 
-            for b in range(patch_outputs.shape[0]):
-                batch_numpy_output = patch_outputs[b].data.cpu().numpy()
+            for b in range(pred.shape[0]):
+                # TODO: not needed, gather does not anyway return anything else but a list of tensors
+                if not isinstance(pred, np.ndarray):
+                    pred_batch = pred[b].data.cpu().numpy()
+                else:
+                    pred_batch = pred[b]
+                patch_mask_batch = None if patch_mask is None else patch_mask[b].data.cpu().numpy()
                 full_output, mask = self.blend_new_patch(full_output, mask,
-                                                        batch_numpy_output,
-                                                        indices[b].base_sequence_at_index)
+                                                        pred_batch,
+                                                        indices[b].base_sequence_at_index,
+                                                         patch_mask=patch_mask_batch)
 
             iteration_num += 1
 
@@ -403,17 +464,17 @@ class AffinityInferenceMixin(ParsingMixin):
             ds_ratio = self.get("inference/global_ds_ratio")
             global_padding = self.get("inference/global_padding")
             full_shape = self.get("full_volume_infer_shape")
-            crop = tuple(slice(pad[0],
+            crop = (slice(None),) +  tuple(slice(pad[0],
                                full_shape[i] - pad[1],
                                ds_ratio[i]) for i, pad in enumerate(
                 global_padding))
-            full_output = full_output[(slice(None),) + crop]
+            full_output = full_output[crop]
             mask = mask[crop]
 
         # divide by the mask to normalize all pixels
         assert (mask != 0).all(), "Not all parts of the dataset have been predicted! " \
                                   "(Is the stride set correctly..?)"
-        assert mask.shape == full_output.shape[1:]
+        assert mask.shape == full_output.shape
         full_output /= mask
 
         self.save_infer_output(full_output)
@@ -424,7 +485,7 @@ class AffinityInferenceMixin(ParsingMixin):
     def postprocess_patch_outputs(self, patch_outputs):
         return patch_outputs
 
-    def blend_new_patch(self, full_output, mask, patch_output, slicing):
+    def blend_new_patch(self, full_output, mask, patch_output, slicing, patch_mask=None):
         assert isinstance(patch_output, np.ndarray)
         assert patch_output.ndim == 4
 
@@ -432,6 +493,8 @@ class AffinityInferenceMixin(ParsingMixin):
         patch_shape = patch_output.shape[1:]
         if full_output is None:
             full_output = np.zeros((nb_channels,) + self.get("full_volume_infer_shape"), dtype='float32')
+        if mask is None:
+            mask = np.zeros((nb_channels,) + self.get("full_volume_infer_shape"), dtype='float32')
 
         local_slicing, global_slicing = self.get_slicings(slicing, patch_shape)
 
@@ -440,7 +503,10 @@ class AffinityInferenceMixin(ParsingMixin):
         #     output_patch, blending_mask = self.blending(output_patch)
         #     mask[global_slicing] += blending_mask[local_slicing]
         # else:
-        mask[global_slicing[1:]] += 1
+        if patch_mask is None:
+            mask[global_slicing] += 1
+        else:
+            mask[global_slicing] += patch_mask[local_slicing]
         # add up predictions in the output
         full_output[global_slicing] += patch_output[local_slicing]
 
@@ -492,8 +558,9 @@ class AffinityInferenceMixin(ParsingMixin):
         if not hasattr(self, '_trainer'):
 
             # noinspection PyAttributeOutsideInit
-            self._trainer = inferno.trainers.basic.Trainer() \
-                .load(self.get("inference/path_checkpoint_trainer"), best=True)
+            self._trainer = inferno.trainers.basic.Trainer(self.model)
+            # self._trainer = inferno.trainers.basic.Trainer() \
+            #     .load(self.get("inference/path_checkpoint_trainer"), best=True)
 
             self._trainer.to(self.device)
 
