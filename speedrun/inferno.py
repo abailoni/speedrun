@@ -472,9 +472,14 @@ class AffinityInferenceMixin(ParsingMixin):
             mask = mask[crop]
 
         # divide by the mask to normalize all pixels
-        assert (mask != 0).all(), "Not all parts of the dataset have been predicted! " \
-                                  "(Is the stride set correctly..?)"
         assert mask.shape == full_output.shape
+        if not (mask != 0).all():
+            print("Not all parts of the dataset have been predicted! (Is the stride set correctly..?)")
+            # assert (mask != 0).all(), "Not all parts of the dataset have been predicted! " \
+            #                       "(Is the stride set correctly..?)"
+            full_output[mask == 0] = -1.
+            mask[mask == 0] = 1.
+
         full_output /= mask
 
         self.save_infer_output(full_output)
@@ -507,6 +512,7 @@ class AffinityInferenceMixin(ParsingMixin):
             mask[global_slicing] += 1
         else:
             mask[global_slicing] += patch_mask[local_slicing]
+            patch_output[local_slicing] *= patch_mask[local_slicing]
         # add up predictions in the output
         full_output[global_slicing] += patch_output[local_slicing]
 
