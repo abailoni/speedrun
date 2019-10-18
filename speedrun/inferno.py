@@ -5,9 +5,12 @@ import os
 from .py_utils import locate, get_single_key_value_pair, create_instance
 from .log_anywhere import register_logger, log_scalar
 from .tensorboard import TensorboardMixin
+from copy import deepcopy
 
 try:
     import inferno
+    from inferno.utils import python_utils as pyu
+    from inferno.io.core.base import IndexSpec
 except ImportError:
     inferno = None
 try:
@@ -393,18 +396,16 @@ class SimpleInferenceMixin(InfernoMixin):
 class AffinityInferenceMixin(ParsingMixin):
 
     def infer(self):
-        full_volume_shape = self.get("full_volume_infer_shape")
-        assert isinstance(full_volume_shape, tuple)
-
-        # TODO: (add augmentation)
-
         self.trainer.eval_mode()
+
+        # Update loader depending on the output shape:
+        self.deduce_crops_and_strides_from_output_size()
 
         # Everytime we should loop over the full dataset (restart generators):
         loader_iter = self.infer_loader.__iter__()
-
-        from inferno.utils import python_utils as pyu
-        from inferno.io.core.base import IndexSpec
+        full_volume_shape = self.get("full_volume_infer_shape")
+        assert isinstance(full_volume_shape, tuple)
+        # TODO: (add augmentation)
 
         # Output files
         full_output = None
@@ -424,24 +425,7 @@ class AffinityInferenceMixin(ParsingMixin):
                                                                            "should return the indices"
             self.trainer.console.progress("{} of {} inference predictions done".format(iteration_num, nb_tot_predictions))
 
-            # Delay SIGINTs till after computation
-            with pyu.delayed_keyboard_interrupt(), torch.no_grad():
-                # Wrap
-                inputs = self.trainer.to_device(inputs)
-                patch_outputs = self.trainer.apply_model(*inputs)
-
-            # FIXME: improve this
-            if self.get("inference/return_patch_mask"):
-                assert isinstance(patch_outputs, tuple)
-                assert len(patch_outputs) == 2
-                pred, patch_mask = patch_outputs
-            else:
-                patch_mask = None
-                if isinstance(patch_outputs, list):
-                    pred = patch_outputs[0]
-                else:
-                    pred = patch_outputs
-            pred = self.postprocess_patch_outputs(pred)
+            pred, patch_mask = self.get_prediction(inputs)
 
             for b in range(pred.shape[0]):
                 # TODO: not needed, gather does not anyway return anything else but a list of tensors
@@ -458,12 +442,16 @@ class AffinityInferenceMixin(ParsingMixin):
             iteration_num += 1
 
 
+
         # Crop full output:
         if self.get("inference/global_padding", False):
             # FIXME: assert and place all this stuff in a better place...!!
             ds_ratio = self.get("inference/global_ds_ratio")
             global_padding = self.get("inference/global_padding")
+            out_dws_fct = self.get("inference/output_dws_fact", [1, 1, 1])
+            global_padding = [[int(pad[0]/dws),int(pad[1]/dws)] for pad, dws in zip(global_padding, out_dws_fct)]
             full_shape = self.get("full_volume_infer_shape")
+
             crop = (slice(None),) +  tuple(slice(pad[0],
                                full_shape[i] - pad[1],
                                ds_ratio[i]) for i, pad in enumerate(
@@ -474,7 +462,7 @@ class AffinityInferenceMixin(ParsingMixin):
         # divide by the mask to normalize all pixels
         assert mask.shape == full_output.shape
         if not (mask != 0).all():
-            print("Not all parts of the dataset have been predicted! (Is the stride set correctly..?)")
+            print("Warning! Not all parts of the dataset have been predicted!")
             # assert (mask != 0).all(), "Not all parts of the dataset have been predicted! " \
             #                       "(Is the stride set correctly..?)"
             full_output[mask == 0] = -1.
@@ -483,6 +471,100 @@ class AffinityInferenceMixin(ParsingMixin):
         full_output /= mask
 
         self.save_infer_output(full_output)
+
+
+    def deduce_crops_and_strides_from_output_size(self):
+        # Get the first batch and compare input/output sizes:
+        inputs, _ = self.infer_loader.dataset[0]
+        # FIXME: this crap
+        if isinstance(inputs, tuple):
+            inputs = tuple(inp.unsqueeze(0) for inp in inputs)
+        elif isinstance(inputs, list):
+            inputs = list(inp.unsqueeze(0) for inp in inputs)
+        else:
+            inputs = inputs.unsqueeze(0)
+        outputs, _ = self.get_prediction(inputs)
+
+        # Process outputs:
+        if isinstance(inputs, (tuple, list)):
+            print("WARNING: considering the first input!")
+            inputs = inputs[0]
+        if isinstance(outputs, (tuple, list)):
+            print("WARNING: considering the first output!")
+            outputs = outputs[0]
+        in_shape = inputs.shape[-3:]
+        out_shape = outputs.shape[-3:]
+
+        # Get local crop config (can be asymmetric!)
+        local_crop = self.get("inference/crop_prediction")
+        if hasattr(self.model, "final_asym_crop_pred"):
+            model_local_crop = self.model.final_asym_crop_pred
+            if local_crop is None:
+                local_crop = model_local_crop
+            else:
+                # Combine two crops:
+                local_crop = [[crp[0]+mdl_crp[0], crp[1]+mdl_crp[1]] for crp, mdl_crp in zip(local_crop, model_local_crop)]
+
+        if local_crop is not None:
+            # slicing w.r.t the current output
+            assert isinstance(local_crop, (tuple, list))
+            assert len(local_crop) == 3 and all([len(cr) == 2 for cr in local_crop])
+            local_slicing = tuple(slice(pad[0],
+                                        out_shape[i] - pad[1])
+                                  for i, pad in enumerate(local_crop))
+            self.set("inference/crop_prediction", local_crop)
+            out_shape_cropped = outputs[(slice(None), slice(None)) + local_slicing].shape[-3:]
+        else:
+            out_shape_cropped = outputs.shape[-3:]
+            local_crop = [[0,0], [0,0], [0,0]]
+
+        in_dws_fct = self.get("inference/input_dws_fact", [1,1,1])
+        out_dws_fct = self.get("inference/output_dws_fact", [1,1,1])
+        out_shape_scaled = tuple(int(sh*dws) for sh, dws in zip(out_shape_cropped, out_dws_fct))
+
+        # Update the stride:
+        self.set("loaders/infer/volume_config/stride", list(out_shape_scaled))
+        print("Shape of final prediction: {}. In the original res: {}".format(out_shape_cropped, out_shape_scaled))
+
+        # Deduce global crop, that should be in the output resolution:
+        input_shape_in_out_res = tuple(int(sh*dws_in/dws_out) for sh, dws_in, dws_out in zip(in_shape, in_dws_fct, out_dws_fct))
+        global_crop = deepcopy(local_crop)
+        diff = [in_sh-out_sh-pad[0]-pad[1] for in_sh, out_sh, pad in zip(input_shape_in_out_res, out_shape_cropped, global_crop)]
+        assert all(d % 2 == 0 for d in diff), "Something unexpected happened while cropping"
+        global_crop = [[int(d/2)+pad[0], int(d/2)+pad[1]] for d, pad in zip(diff, global_crop)]
+
+        # Save deduced crop for later:
+        self.set("inference/crop_global_slice", global_crop)
+        
+        # Re-build the inference-loader after setting the new stride:
+        self._infer_loader = self.build_infer_loader()
+
+
+
+    def get_prediction(self, inputs):
+        # Delay SIGINTs till after computation
+        with pyu.delayed_keyboard_interrupt(), torch.no_grad():
+            # Wrap
+            inputs = self.trainer.to_device(inputs)
+            if isinstance(inputs, (tuple, list)):
+                patch_outputs = self.trainer.apply_model(*inputs)
+            else:
+                patch_outputs = self.trainer.apply_model(inputs)
+
+        # FIXME: improve this
+        if self.get("inference/return_patch_mask"):
+            assert isinstance(patch_outputs, tuple)
+            assert len(patch_outputs) == 2
+            pred, mask = patch_outputs
+        else:
+            mask = None
+            if isinstance(patch_outputs, list):
+                pred = patch_outputs[0]
+            else:
+                pred = patch_outputs
+        pred = self.postprocess_patch_outputs(pred)
+
+        return pred, mask
 
     def save_infer_output(self, output):
         pass
@@ -523,18 +605,21 @@ class AffinityInferenceMixin(ParsingMixin):
         prediction_crop = self.get("inference/crop_prediction", False)
         assert all([slicing[i].step == 1 for i in range(3)]), "Downscaling option not implemented yet!"
 
+        # Check whether the output has a different resolution, then rescale global slicing:
+        out_dws_fct = self.get("inference/output_dws_fact", [1,1,1])
+        # print(slicing)
+        # assert all(all((slc.start % dws == 0, slc.stop % dws == 0)) for slc, dws in zip(slicing, out_dws_fct))
+        global_slicing = tuple(slice(int(slc.start / dws), int(slc.stop / dws) ) for slc, dws in zip(slicing, out_dws_fct))
+
         # crop away the padding (we treat global as local padding) if specified
         # this is generally not necessary if we use blending
         if slice_crop:
             # slicing w.r.t the global output
             assert isinstance(slice_crop, (tuple, list))
             assert len(slice_crop) == 3 and all([len(cr) == 2 for cr in slice_crop])
-            global_slicing = tuple(slice(slicing[i].start + pad[0],
-                                         slicing[i].stop - pad[1])
+            global_slicing = tuple(slice(global_slicing[i].start + pad[0],
+                                         global_slicing[i].stop - pad[1])
                                    for i, pad in enumerate(slice_crop))
-        else:
-            # otherwise do not crop
-            global_slicing = slicing
         if prediction_crop:
             # slicing w.r.t the current output
             assert isinstance(prediction_crop, (tuple, list))
@@ -595,4 +680,9 @@ class AffinityInferenceMixin(ParsingMixin):
     def infer_loader(self):
         if not hasattr(self, '_infer_loader'):
             self._infer_loader = self.build_infer_loader()
+            out_dws_fact = self.get("inference/output_dws_fact", [1,1,1])
+            self.set("full_volume_infer_shape", tuple(int(sh/scl) for sh, scl in zip(self._infer_loader.dataset.volume.shape, out_dws_fact)))
+            self.set("inference/global_padding", self._infer_loader.dataset.padding)
+            self.set("inference/global_ds_ratio", self._infer_loader.dataset.downsampling_ratio)
+
         return self._infer_loader
