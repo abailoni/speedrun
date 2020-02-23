@@ -290,6 +290,14 @@ class BaseExperiment(object):
                 return
             for key in reversed(keys):
                 update_config = {key: update_config}
+            # else:
+            #
+            # # Remove all spaces:
+            # split = [spl.replace(" ", "") for spl in split]
+            # for extra_conf_path in split[1:]:
+            #     with open(extra_conf_path + '.yml', 'r') as f:
+            #         extra_config = yaml.load(f)
+            #     update_config = recursive_update(update_config, extra_config)
 
         self._config = recursive_update(self._config, update_config)
         return self

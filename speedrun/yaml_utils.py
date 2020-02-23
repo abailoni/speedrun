@@ -97,7 +97,7 @@ def _recursive_update_inplace(d1, d2):
         # if requested, just override the whole dict d1
         return d2.after_override()
     for key, value in d2.items():
-        if isinstance(value, KeyDeleter):
+        if isinstance(value, KeyDeleter) or value == "KeyDeleter":
             # delete the key in d1 if requested
             if key in d1:
                 del d1[key]

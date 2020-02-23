@@ -478,6 +478,10 @@ class AffinityInferenceMixin(ParsingMixin):
     def deduce_crops_and_strides_from_output_size(self):
         # Get the first batch and compare input/output sizes:
         inputs, _ = self.infer_loader.dataset[0]
+
+        # Get original input shape:
+        in_shape = self.get("loaders/infer/volume_config/window_size")
+
         # FIXME: this crap
         if isinstance(inputs, tuple):
             inputs = tuple(inp.unsqueeze(0) for inp in inputs)
@@ -488,13 +492,13 @@ class AffinityInferenceMixin(ParsingMixin):
         outputs, _ = self.get_prediction(inputs)
 
         # Process outputs:
-        if isinstance(inputs, (tuple, list)):
-            print("WARNING: considering the first input!")
-            inputs = inputs[0]
+        # if isinstance(inputs, (tuple, list)):
+        #     print("WARNING: considering the first input!")
+        #     inputs = inputs[0]
         if isinstance(outputs, (tuple, list)):
             print("WARNING: considering the first output!")
             outputs = outputs[0]
-        in_shape = inputs.shape[-3:]
+        # in_shape = inputs.shape[-3:]
         out_shape = outputs.shape[-3:]
 
         # Get local crop config (can be asymmetric!)
@@ -506,6 +510,7 @@ class AffinityInferenceMixin(ParsingMixin):
             else:
                 # Combine two crops:
                 local_crop = [[crp[0]+mdl_crp[0], crp[1]+mdl_crp[1]] for crp, mdl_crp in zip(local_crop, model_local_crop)]
+
 
         if local_crop is not None:
             # slicing w.r.t the current output
@@ -520,7 +525,6 @@ class AffinityInferenceMixin(ParsingMixin):
             out_shape_cropped = outputs.shape[-3:]
             local_crop = [[0,0], [0,0], [0,0]]
 
-        in_dws_fct = self.get("inference/input_dws_fact", [1,1,1])
         out_dws_fct = self.get("inference/output_dws_fact", [1,1,1])
         out_shape_scaled = tuple(int(sh*dws) for sh, dws in zip(out_shape_cropped, out_dws_fct))
 
@@ -529,7 +533,7 @@ class AffinityInferenceMixin(ParsingMixin):
         print("Shape of final prediction: {}. In the original res: {}".format(out_shape_cropped, out_shape_scaled))
 
         # Deduce global crop, that should be in the output resolution:
-        input_shape_in_out_res = tuple(int(sh*dws_in/dws_out) for sh, dws_in, dws_out in zip(in_shape, in_dws_fct, out_dws_fct))
+        input_shape_in_out_res = tuple(int(sh/dws_out) for sh, dws_out in zip(in_shape, out_dws_fct))
         global_crop = deepcopy(local_crop)
         diff = [in_sh-out_sh-pad[0]-pad[1] for in_sh, out_sh, pad in zip(input_shape_in_out_res, out_shape_cropped, global_crop)]
         assert all(d % 2 == 0 for d in diff), "Something unexpected happened while cropping"
