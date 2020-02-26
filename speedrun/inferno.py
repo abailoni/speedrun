@@ -396,6 +396,9 @@ class SimpleInferenceMixin(InfernoMixin):
 
 
 class AffinityInferenceMixin(ParsingMixin):
+    def __init__(self, *super_args, **super_kwargs):
+        super(AffinityInferenceMixin, self).__init__(*super_args, **super_kwargs)
+        self._blending = None
 
     def infer(self):
         self.trainer.eval_mode()
@@ -436,6 +439,7 @@ class AffinityInferenceMixin(ParsingMixin):
                 else:
                     pred_batch = pred[b]
                 patch_mask_batch = None if patch_mask is None else patch_mask[b].data.cpu().numpy()
+
                 full_output, mask = self.blend_new_patch(full_output, mask,
                                                         pred_batch,
                                                         indices[b].base_sequence_at_index,
@@ -529,8 +533,14 @@ class AffinityInferenceMixin(ParsingMixin):
         out_shape_scaled = tuple(int(sh*dws) for sh, dws in zip(out_shape_cropped, out_dws_fct))
 
         # Update the stride:
-        self.set("loaders/infer/volume_config/stride", list(out_shape_scaled))
+        window_overlap = self.get("inference/window_overlap", [0, 0, 0])
+        assert len(window_overlap) == 3
+        stride = [shp-ovrlap*2 for shp, ovrlap in zip(list(out_shape_scaled), window_overlap)]
+        assert all(strd>0 for strd in stride), "Too much overlap for the current output shape of the model: " \
+                                               "{}, {}".format(window_overlap, out_shape_scaled)
+        self.set("loaders/infer/volume_config/stride", stride)
         print("Shape of final prediction: {}. In the original res: {}".format(out_shape_cropped, out_shape_scaled))
+        print("Stride: {}.".format(stride))
 
         # Deduce global crop, that should be in the output resolution:
         input_shape_in_out_res = tuple(int(sh/dws_out) for sh, dws_out in zip(in_shape, out_dws_fct))
@@ -591,20 +601,42 @@ class AffinityInferenceMixin(ParsingMixin):
 
         local_slicing, global_slicing = self.get_slicings(slicing, patch_shape)
 
-        # TODO: add blending
-        # if self.blending is not None:
-        #     output_patch, blending_mask = self.blending(output_patch)
-        #     mask[global_slicing] += blending_mask[local_slicing]
-        # else:
-        if patch_mask is None:
-            mask[global_slicing] += 1
-        else:
+        # Apply local slicing in any case:
+        patch_output = patch_output[local_slicing]
+
+        if patch_mask is not None:
+            assert self.blending is None, "Outputed masks and blending are not supported at the same time"
             mask[global_slicing] += patch_mask[local_slicing]
-            patch_output[local_slicing] *= patch_mask[local_slicing]
+            patch_output *= patch_mask[local_slicing]
+        else:
+            if self.blending is not None:
+                patch_output, blending_mask = self.blending(patch_output)
+                mask[global_slicing] += blending_mask
+            else:
+                mask[global_slicing] += 1
         # add up predictions in the output
-        full_output[global_slicing] += patch_output[local_slicing]
+        full_output[global_slicing] += patch_output
 
         return full_output, mask
+
+    @property
+    def blending(self):
+        if self._blending is not None:
+            return self._blending
+        else:
+            if self.get("inference/blending_kwargs", None) is not None:
+                # TODO: fix reference...
+                from neurofire.inference.blending import Blending
+                blending_kwargs = self.get("inference/blending_kwargs")
+                if "ramp_size" not in blending_kwargs:
+                    window_overlap = self.get("inference/window_overlap", None)
+                    assert window_overlap is not None, "No ramp size could be deduced for blending"
+                    blending_kwargs['ramp_size'] = window_overlap
+                self._blending = Blending(**blending_kwargs)
+                return self._blending
+                # TODO: init _blending
+            else:
+                return None
 
     def get_slicings(self, slicing, shape):
         slice_crop = self.get("inference/crop_global_slice", False)
