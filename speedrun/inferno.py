@@ -575,7 +575,8 @@ class AffinityInferenceMixin(ParsingMixin):
         else:
             mask = None
             if isinstance(patch_outputs, list):
-                pred = patch_outputs[0]
+                output_idx = self.get("inference/index_output", 0)
+                pred = patch_outputs[output_idx]
             else:
                 pred = patch_outputs
         pred = self.postprocess_patch_outputs(pred)
