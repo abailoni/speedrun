@@ -484,7 +484,19 @@ class AffinityInferenceMixin(ParsingMixin):
         inputs, _ = self.infer_loader.dataset[0]
 
         # Get original input shape:
-        in_shape = self.get("loaders/infer/volume_config/window_size")
+        vol_config = self.get("loaders/infer/volume_config", ensure_exists=True)
+
+        def recursive_key_search(dict, out_key):
+            if out_key in dict:
+                return dict[out_key]
+            else:
+                for key in dict:
+                    out = recursive_key_search(dict[key], out_key)
+                    if out is not None:
+                        return out
+                return None
+        in_shape = recursive_key_search(vol_config, "window_size")
+        assert in_shape is not None, "Input window_size not found in config"
 
         # FIXME: this crap
         if isinstance(inputs, tuple):
@@ -642,6 +654,8 @@ class AffinityInferenceMixin(ParsingMixin):
     def get_slicings(self, slicing, shape):
         slice_crop = self.get("inference/crop_global_slice", False)
         prediction_crop = self.get("inference/crop_prediction", False)
+        if len(slicing) == 4:
+            slicing = slicing[1:]
         assert all([slicing[i].step == 1 for i in range(3)]), "Downscaling option not implemented yet!"
 
         # Check whether the output has a different resolution, then rescale global slicing:
@@ -720,8 +734,18 @@ class AffinityInferenceMixin(ParsingMixin):
         if not hasattr(self, '_infer_loader'):
             self._infer_loader = self.build_infer_loader()
             out_dws_fact = self.get("inference/output_dws_fact", [1,1,1])
-            self.set("full_volume_infer_shape", tuple(int(sh/scl) for sh, scl in zip(self._infer_loader.dataset.volume.shape, out_dws_fact)))
-            self.set("inference/global_padding", self._infer_loader.dataset.padding)
-            self.set("inference/global_ds_ratio", self._infer_loader.dataset.downsampling_ratio)
+            if hasattr(self._infer_loader.dataset, "volume"):
+                dataset = self._infer_loader.dataset
+            elif hasattr(self._infer_loader.dataset, "datasets"):
+                dataset = self._infer_loader.dataset.datasets[0]
+            else:
+                raise ValueError("Dataset not found in infer_loader")
+            full_shape = dataset.volume.shape
+            if dataset.is_multichannel:
+                full_shape = full_shape[1:]
+            assert len(full_shape) == 3
+            self.set("full_volume_infer_shape", tuple(int(sh/scl) for sh, scl in zip(full_shape, out_dws_fact)))
+            self.set("inference/global_padding", dataset.padding)
+            self.set("inference/global_ds_ratio", dataset.downsampling_ratio)
 
         return self._infer_loader
